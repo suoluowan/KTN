@@ -41,3 +41,6 @@ wheels/
 .vscode
 detectron2/model_zoo/configs
 projects/KTN/densepose
+work_dirs/
+datasets/coco/
+projects/KTNv2/datasets/
