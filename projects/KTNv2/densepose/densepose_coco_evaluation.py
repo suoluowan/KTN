@@ -134,13 +134,13 @@ class DensePoseCocoEval(object):
 
     def _loadGEval(self):
         smpl_subdiv_fpath = PathManager.get_local_path(
-            "https://dl.fbaipublicfiles.com/densepose/data/SMPL_subdiv.mat"
+            "/home/sunjunyao/detectron2.old/projects/DensePose/pretrain_model/SMPL_subdiv.mat"
         )
         pdist_transform_fpath = PathManager.get_local_path(
-            "https://dl.fbaipublicfiles.com/densepose/data/SMPL_SUBDIV_TRANSFORM.mat"
+            "/home/sunjunyao/detectron2.old/projects/DensePose/pretrain_model/SMPL_SUBDIV_TRANSFORM.mat"
         )
         pdist_matrix_fpath = PathManager.get_local_path(
-            "https://dl.fbaipublicfiles.com/densepose/data/Pdist_matrix.pkl", timeout_sec=120
+            "/home/sunjunyao/detectron2.old/projects/DensePose/pretrain_model/Pdist_matrix.pkl", timeout_sec=120
         )
         SMPL_subdiv = loadmat(smpl_subdiv_fpath)
         self.PDIST_transform = loadmat(pdist_transform_fpath)

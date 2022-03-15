@@ -24,7 +24,9 @@ from .densepose_head import (
     dp_keypoint_rcnn_loss, 
     ASPPConv, 
     initialize_module_params, 
-    build_ktn_losses
+    build_ktn_losses,
+    build_sabl_losses,
+    sabl_inference
 )
 
 class FeatureAdaptation(torch.nn.Module):
@@ -477,6 +479,115 @@ class DensePoseKTNHeads(DensePoseROIHeads):
                 confidences = tuple([empty_tensor] * 6)
 
             densepose_inference(densepose_outputs[:4], confidences, instances, self.mask_thresh)
+            return instances
+
+@ROI_HEADS_REGISTRY.register()
+class SABLKTNHeads(DensePoseROIHeads):
+    """
+    A Standard ROIHeads which contains an addition of DensePose head.
+    """
+
+    def __init__(self, cfg, input_shape):
+        super().__init__(cfg, input_shape)
+        self._init_dp_keypoint_head(cfg,input_shape)
+        self.densepose_losses = build_sabl_losses(cfg)
+
+
+    def _init_dp_keypoint_head(self, cfg,input_shape):
+        # fmt: off
+
+        self.dp_keypoint_on                      = cfg.MODEL.ROI_DENSEPOSE_HEAD.KPT_ON
+        if not self.dp_keypoint_on:
+            return
+        self.normalize_loss_by_visible_keypoints = cfg.MODEL.ROI_KEYPOINT_HEAD.NORMALIZE_LOSS_BY_VISIBLE_KEYPOINTS  # noqa
+        self.keypoint_loss_weight                = cfg.MODEL.ROI_KEYPOINT_HEAD.LOSS_WEIGHT
+        self.positive_sample_fraction = 0.25
+
+    def _forward_dp_keypoint(self, keypoint_logits, instances):
+
+        if not self.dp_keypoint_on:
+            return {} if self.training else instances
+        num_images = len(instances)
+        if self.training:
+            # The loss is defined on positive proposals with at >=1 visible keypoints.
+            normalizer = (
+                num_images
+                * self.batch_size_per_image
+                * self.positive_sample_fraction
+                * keypoint_logits.shape[1]
+            )
+            loss = dp_keypoint_rcnn_loss(
+                keypoint_logits,
+                instances,
+                normalizer=None if self.normalize_loss_by_visible_keypoints else normalizer,
+            )
+            return {"loss_keypoint": loss * self.keypoint_loss_weight}
+        else:
+            keypoint_rcnn_inference(keypoint_logits, instances)
+            return instances
+
+    def _forward_densepose(self, features, instances):
+        """
+        Forward logic of the densepose prediction branch.
+
+        Args:
+            features (list[Tensor]): #level input features for densepose prediction
+            instances (list[Instances]): the per-image instances to train/predict densepose.
+                In training, they can be the proposals.
+                In inference, they can be the predicted boxes.
+
+        Returns:
+            In training, a dict of losses.
+            In inference, update `instances` with new fields "densepose" and return it.
+        """
+        if not self.densepose_on:
+            return {} if self.training else instances
+
+        features = [features[f] for f in self.in_features]
+        if self.training:
+            proposals, _ = select_foreground_proposals(instances, self.num_classes)
+            features, proposals = self.densepose_data_filter(features, proposals)
+            if len(proposals) > 0:
+                proposal_boxes = [x.proposal_boxes for x in proposals]
+                
+                if self.use_decoder:
+                    features = [self.decoder(features)]
+
+                features_dp = self.densepose_pooler(features, proposal_boxes)
+                densepose_head_outputs = self.densepose_head(features_dp)
+                densepose_outputs, densepose_outputs_lowres, confidences, _ = self.densepose_predictor(densepose_head_outputs)
+                if self.dp_keypoint_on:
+                    keypoints_output = densepose_outputs[-1]
+                    densepose_outputs = densepose_outputs[:-1]
+                densepose_loss_dict = self.densepose_losses(
+                    proposals, densepose_outputs+densepose_outputs_lowres[1:2], confidences
+                )
+                if self.dp_keypoint_on:
+                    kpt_loss_dict = self._forward_dp_keypoint(keypoints_output, proposals)
+                    for _, k in enumerate(kpt_loss_dict.keys()):
+                        densepose_loss_dict[k] = kpt_loss_dict[k]
+                return densepose_loss_dict
+        else:
+            pred_boxes = [x.pred_boxes for x in instances]
+            if self.use_decoder:
+                features = [self.decoder(features)]
+
+            features_dp = self.densepose_pooler(features, pred_boxes)
+            if len(features_dp) > 0:
+                densepose_head_outputs = self.densepose_head(features_dp)
+                densepose_outputs, _, confidences, _ = self.densepose_predictor(densepose_head_outputs)
+                if self.dp_keypoint_on:
+                    keypoints_output = densepose_outputs[-1]
+                    densepose_outputs = densepose_outputs[:-1]
+                    instances = self._forward_dp_keypoint(keypoints_output, instances)
+            else:
+                # If no detection occured instances
+                # set densepose_outputs to empty tensors
+                empty_tensor = torch.zeros(size=(0, 0, 0, 0), device=features_dp.device)
+                densepose_outputs = tuple([empty_tensor] * 6)
+                confidences = tuple([empty_tensor] * 6)
+
+            sabl_inference(densepose_outputs[:6], confidences, instances, self.mask_thresh)
             return instances
 
 @ROI_HEADS_REGISTRY.register()

@@ -18,7 +18,11 @@ from detectron2.utils.registry import Registry
 
 from .data.structures import DensePoseOutput
 
+import json
+import numpy as np
+
 ROI_DENSEPOSE_HEAD_REGISTRY = Registry("ROI_DENSEPOSE_HEAD")
+BLOBK_NUM = 5
 
 
 class DensePoseUVConfidenceType(Enum):
@@ -450,6 +454,8 @@ class DensePoseV1ConvXHead(nn.Module):
         pad_size = kernel_size // 2
         n_channels = input_channels
         for i in range(self.n_stacked_convs):
+            if i == self.n_stacked_convs-1:
+                hidden_dim = 512
             layer = Conv2d(n_channels, hidden_dim, kernel_size, stride=1, padding=pad_size)
             layer_name = self._get_layer_name(i)
             self.add_module(layer_name, layer)
@@ -559,12 +565,12 @@ class DensePosePredictor(nn.Module):
         self.index_uv_lowres = ConvTranspose2d(
             dim_in, dim_out_patches, kernel_size, stride=2, padding=int(kernel_size / 2 - 1)
         )
-        self.u_lowres = ConvTranspose2d(
-            dim_in, dim_out_patches, kernel_size, stride=2, padding=int(kernel_size / 2 - 1)
-        )
-        self.v_lowres = ConvTranspose2d(
-            dim_in, dim_out_patches, kernel_size, stride=2, padding=int(kernel_size / 2 - 1)
-        )
+        # self.u_lowres = ConvTranspose2d(
+        #     dim_in, dim_out_patches, kernel_size, stride=2, padding=int(kernel_size / 2 - 1)
+        # )
+        # self.v_lowres = ConvTranspose2d(
+        #     dim_in, dim_out_patches, kernel_size, stride=2, padding=int(kernel_size / 2 - 1)
+        # )
         self.scale_factor = cfg.MODEL.ROI_DENSEPOSE_HEAD.UP_SCALE
         self.confidence_model_cfg = DensePoseConfidenceModelConfig.from_cfg(cfg)
         self._initialize_confidence_estimation_layers(cfg, self.confidence_model_cfg, dim_in)
@@ -775,6 +781,112 @@ class DensePoseKptRelationPredictor(DensePosePredictor):
         return (
             (ann_index, index_uv, u, v, k),
             (ann_index_lowres, index_uv_lowres, u_lowres, v_lowres),
+            (sigma_1, sigma_2, kappa_u, kappa_v, fine_segm_confidence, coarse_segm_confidence),
+            (
+                sigma_1_lowres,
+                sigma_2_lowres,
+                kappa_u_lowres,
+                kappa_v_lowres,
+                fine_segm_confidence_lowres,
+                coarse_segm_confidence_lowres,
+            ),
+        )
+
+@ROI_DENSEPOSE_HEAD_REGISTRY.register()
+class SABLKptRelationPredictor(DensePosePredictor):
+
+    def __init__(self, cfg, input_channels):
+        super(SABLKptRelationPredictor, self).__init__(cfg, input_channels)
+        dim_in = input_channels
+        self.dp_keypoints_on = cfg.MODEL.ROI_DENSEPOSE_HEAD.KPT_ON
+        self.KPT_UP_SCALE = cfg.MODEL.ROI_DENSEPOSE_HEAD.KPT_UP_SCALE
+        self.kernel_size = cfg.MODEL.ROI_DENSEPOSE_HEAD.DECONV_KERNEL
+        self.scale_factor = cfg.MODEL.ROI_DENSEPOSE_HEAD.UP_SCALE
+
+        self.u_cls_lowres = ConvTranspose2d(
+            dim_in, 24*BLOBK_NUM, self.kernel_size, stride=2, padding=int(self.kernel_size / 2 - 1)
+        )
+        self.v_cls_lowres = ConvTranspose2d(
+            dim_in, 24*BLOBK_NUM, self.kernel_size, stride=2, padding=int(self.kernel_size / 2 - 1)
+        )
+        self.u_offset_lowres = ConvTranspose2d(
+            dim_in, 24*BLOBK_NUM, self.kernel_size, stride=2, padding=int(self.kernel_size / 2 - 1)
+        )
+        self.v_offset_lowres = ConvTranspose2d(
+            dim_in, 24*BLOBK_NUM, self.kernel_size, stride=2, padding=int(self.kernel_size / 2 - 1)
+        )
+
+        if self.dp_keypoints_on:
+            kpt_weight_dir = cfg.MODEL.ROI_DENSEPOSE_HEAD.KPT_CLASSIFIER_WEIGHT_DIR
+            kpt_weight = pickle.load(open(kpt_weight_dir, 'rb'))
+            np_kpt_weight = torch.FloatTensor(kpt_weight['kpt_weight'])
+            np_kpt_bias = torch.FloatTensor(kpt_weight['kpt_bias'])
+            self.body_kpt_weight = Parameter(data=np_kpt_weight, requires_grad=True)
+            self.body_kpt_bias = Parameter(data=np_kpt_bias, requires_grad=True)
+            sim_matrix_dir = cfg.MODEL.ROI_DENSEPOSE_HEAD.KPT_SURF_RELATION_DIR
+            rel_matrix = pickle.load(open(sim_matrix_dir, 'rb'))
+            rel_matrix = rel_matrix.transpose()
+            rel_matrix = torch.FloatTensor(rel_matrix)
+            self.kpt_surface_transfer_matrix = nn.Parameter(data=rel_matrix, requires_grad=True)
+            index_weight_size = dim_in * self.kernel_size * self.kernel_size
+            kpt_surface_transformer = []
+            kpt_surface_transformer.append(nn.Linear(index_weight_size, index_weight_size))
+            kpt_surface_transformer.append(nn.LeakyReLU(0.02))
+            kpt_surface_transformer.append(nn.Linear(index_weight_size, index_weight_size))
+            self.kpt_surface_transformer = nn.Sequential(*kpt_surface_transformer)
+
+    def generate_surface_weights_from_kpt(self):
+        kpt_weight = self.body_kpt_weight
+        n_in, n_out, h, w = kpt_weight.size(0), kpt_weight.size(1), kpt_weight.size(2), kpt_weight.size(3)
+        kpt_weight = kpt_weight.permute((1, 0, 2, 3)).reshape((n_out, n_in*h*w))
+        body_surface_weight = torch.matmul(self.kpt_surface_transfer_matrix, kpt_weight)
+        body_surface_weight = self.kpt_surface_transformer(body_surface_weight)
+        body_surface_weight = body_surface_weight.reshape((self.kpt_surface_transfer_matrix.size(0), n_in, h, w)).permute((1, 0, 2, 3))
+        return body_surface_weight
+
+    def forward(self, head_outputs):
+        ann_index_lowres = self.ann_index_lowres(head_outputs)
+        u_cls_lowres = self.u_cls_lowres(head_outputs)
+        u_offset_lowres = self.u_offset_lowres(head_outputs)
+        v_cls_lowres = self.v_cls_lowres(head_outputs)
+        v_offset_lowres = self.v_offset_lowres(head_outputs)
+        k_lowres = nn.functional.conv_transpose2d(head_outputs, weight=self.body_kpt_weight, bias=self.body_kpt_bias,
+                                 padding=int(self.kernel_size / 2 - 1), stride=2)
+        body_surface_weight = self.generate_surface_weights_from_kpt()
+        index_uv_lowres = nn.functional.conv_transpose2d(head_outputs, weight=body_surface_weight,
+                                                          padding=int(self.kernel_size / 2 - 1), stride=2)
+        def interp2d(input):
+            return interpolate(
+                input, scale_factor=self.scale_factor, mode="bilinear", align_corners=False
+            )
+
+        ann_index = interp2d(ann_index_lowres)
+        index_uv = interp2d(index_uv_lowres)
+        u_cls = interp2d(u_cls_lowres)
+        u_offset = interp2d(u_offset_lowres)
+        v_cls = interp2d(v_cls_lowres)
+        v_offset = interp2d(v_offset_lowres)
+        if self.KPT_UP_SCALE > 2:
+            k = interp2d(k_lowres)
+        else:
+            k = k_lowres
+        (
+            (sigma_1, sigma_2, kappa_u, kappa_v, fine_segm_confidence, coarse_segm_confidence),
+            (
+                sigma_1_lowres,
+                sigma_2_lowres,
+                kappa_u_lowres,
+                kappa_v_lowres,
+                fine_segm_confidence_lowres,
+                coarse_segm_confidence_lowres,
+            ),
+            (ann_index, index_uv),
+        ) = self._forward_confidence_estimation_layers(
+            self.confidence_model_cfg, head_outputs, interp2d, ann_index, index_uv
+        )
+        return (
+            (ann_index, index_uv, u_cls, u_offset, v_cls, v_offset, k),
+            (ann_index_lowres, index_uv_lowres, u_cls_lowres, u_offset_lowres, v_cls_lowres, v_offset_lowres),
             (sigma_1, sigma_2, kappa_u, kappa_v, fine_segm_confidence, coarse_segm_confidence),
             (
                 sigma_1_lowres,
@@ -1357,6 +1469,87 @@ def densepose_inference(
         detection.pred_densepose = densepose_output_i
         k += n_i
 
+def sabl_inference(
+    densepose_outputs: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    densepose_confidences: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    detections: List[Instances],
+    mask_thresh = 0.5
+):
+    
+    # DensePose outputs: segmentation, body part indices, U, V
+    s, index_uv, u_cls, u_offset, v_cls, v_offset = densepose_outputs
+    with open("/home/sunjunyao/detectron2/projects/PoiseNet/models/block-5.json", "rb") as bFile:
+        block = json.loads(json.load(bFile))
+    block_u_width = torch.tensor(np.array(block["bucket_u_width"]), dtype=torch.float32,device=u_cls.device)
+    block_v_width =  torch.tensor(np.array(block["bucket_v_width"]), dtype=torch.float32,device=u_cls.device)
+    block_u_center =  torch.tensor(np.array(block["bucket_u_center"]), dtype=torch.float32,device=u_cls.device)
+    block_v_center =  torch.tensor(np.array(block["bucket_v_center"]), dtype=torch.float32,device=u_cls.device)
+    del block
+    
+    u_cls = u_cls.reshape(u_cls.shape[0],24,BLOBK_NUM,u_cls.shape[2], u_cls.shape[3])
+    u_offset = u_offset.reshape(u_offset.shape[0],24,BLOBK_NUM,u_offset.shape[2], u_offset.shape[3])
+    v_cls = v_cls.reshape(v_cls.shape[0],24,BLOBK_NUM,v_cls.shape[2], v_cls.shape[3])
+    v_offset = v_offset.reshape(v_offset.shape[0],24,BLOBK_NUM,v_offset.shape[2], v_offset.shape[3])
+    block_u_width = block_u_width[None,:,:,None,None].repeat(1,1,1,u_cls.shape[3], u_cls.shape[4])
+    block_v_width = block_v_width[None,:,:,None,None].repeat(1,1,1,u_cls.shape[3], u_cls.shape[4])
+    block_u_center = block_u_center[None,:,:,None,None].repeat(1,1,1,u_cls.shape[3], u_cls.shape[4])
+    block_v_center = block_v_center[None,:,:,None,None].repeat(1,1,1,u_cls.shape[3], u_cls.shape[4])
+    (
+        sigma_1,
+        sigma_2,
+        kappa_u,
+        kappa_v,
+        fine_segm_confidence,
+        coarse_segm_confidence,
+    ) = densepose_confidences
+    k = 0
+    for detection in detections:
+        n_i = len(detection)
+        # if n_i == 0:
+        #     continue
+        s_i = s[k : k + n_i]
+        index_uv_i = index_uv[k : k + n_i]
+        if n_i == 0:
+            u_i = index_uv[k : k + n_i]
+            v_i = index_uv[k : k + n_i]
+        else:
+            u_cls_i = u_cls[k : k + n_i]
+            u_offset_i = u_offset[k : k + n_i]
+            v_cls_i = v_cls[k : k + n_i]
+            v_offset_i = v_offset[k : k + n_i]
+            block_u_width = block_u_width.repeat(n_i,1,1,1,1)
+            block_v_width = block_v_width.repeat(n_i,1,1,1,1)
+            block_u_center = block_u_center.repeat(n_i,1,1,1,1)
+            block_v_center = block_v_center.repeat(n_i,1,1,1,1)
+        # if n_i == 1:
+        #     u_cls_i = u_cls_i.unsqueeze(0)
+        #     u_offset_i = u_offset_i.unsqueeze(0)
+        #     v_cls_i = v_cls_i.unsqueeze(0)
+            # v_offset_i = v_offset_i.unsqueeze(0)
+            index_u = torch.argmax(u_cls_i, dim=2).unsqueeze(2) # n*24*1*h*w
+            index_v = torch.argmax(v_cls_i, dim=2).unsqueeze(2)
+            u_i = u_offset_i.gather(2, index_u).squeeze(2) * block_u_width.gather(2, index_u).squeeze(2) + block_u_center.gather(2, index_u).squeeze(2)
+            v_i = v_offset_i.gather(2, index_v).squeeze(2) * block_v_width.gather(2, index_v).squeeze(2) + block_v_center.gather(2, index_v).squeeze(2)
+            bg_par = torch.zeros((u_i.shape[0], 1, u_i.shape[2], u_i.shape[3]), dtype=torch.float32,device=u_cls_i.device)
+            u_i = torch.cat((bg_par, u_i), dim=1)
+            v_i = torch.cat((bg_par, v_i), dim=1)
+
+        _local_vars = locals()
+        confidences = {
+            name: _local_vars[name][k : k + n_i]
+            for name in (
+                "sigma_1",
+                "sigma_2",
+                "kappa_u",
+                "kappa_v",
+                "fine_segm_confidence",
+                "coarse_segm_confidence",
+            )
+            if _local_vars.get(name) is not None
+        }
+        densepose_output_i = DensePoseOutput(s_i, index_uv_i, u_i, v_i, confidences, mask_thresh)
+        detection.pred_densepose = densepose_output_i
+        k += n_i
 
 def _linear_interpolation_utilities(v_norm, v0_src, size_src, v0_dst, size_dst, size_z):
     """
@@ -1481,6 +1674,8 @@ def _extract_at_points_packed(
     w_ylo_xhi,
     w_yhi_xlo,
     w_yhi_xhi,
+    block=False,
+    block_slice=None,
 ):
     """
     Extract ground truth values z_gt for valid point indices and estimated
@@ -1490,12 +1685,20 @@ def _extract_at_points_packed(
     w_ylo_xlo, w_ylo_xhi, w_yhi_xlo and w_yhi_xhi.
     Use slice_index_uv to slice dim=1 in z_est
     """
-    z_est_sampled = (
-        z_est[index_bbox_valid, slice_index_uv, y_lo, x_lo] * w_ylo_xlo
-        + z_est[index_bbox_valid, slice_index_uv, y_lo, x_hi] * w_ylo_xhi
-        + z_est[index_bbox_valid, slice_index_uv, y_hi, x_lo] * w_yhi_xlo
-        + z_est[index_bbox_valid, slice_index_uv, y_hi, x_hi] * w_yhi_xhi
-    )
+    if block:
+        z_est_sampled = (
+                z_est[index_bbox_valid, slice_index_uv, block_slice, y_lo, x_lo] * w_ylo_xlo
+                + z_est[index_bbox_valid, slice_index_uv, block_slice, y_lo, x_hi] * w_ylo_xhi
+                + z_est[index_bbox_valid, slice_index_uv, block_slice, y_hi, x_lo] * w_yhi_xlo
+                + z_est[index_bbox_valid, slice_index_uv, block_slice, y_hi, x_hi] * w_yhi_xhi
+            )
+    else:
+        z_est_sampled = (
+            z_est[index_bbox_valid, slice_index_uv, y_lo, x_lo] * w_ylo_xlo
+            + z_est[index_bbox_valid, slice_index_uv, y_lo, x_hi] * w_ylo_xhi
+            + z_est[index_bbox_valid, slice_index_uv, y_hi, x_lo] * w_yhi_xlo
+            + z_est[index_bbox_valid, slice_index_uv, y_hi, x_hi] * w_yhi_xhi
+        )
     return z_est_sampled
 
 
@@ -2121,7 +2324,24 @@ class DensePoseLosses(object):
             losses["loss_densepose_U"] = u_loss
             v_loss = F.smooth_l1_loss(v_est, v_gt, reduction="sum") * self.w_points
             losses["loss_densepose_V"] = v_loss
-        index_uv_loss = F.cross_entropy(index_uv_est, index_uv_gt.long()) * self.w_part
+        
+        # AEQL
+        J = index_uv_gt.shape[0]
+        M = torch.max(index_uv_est, dim=1, keepdim=True)[0]
+        E = self.exclude_func(index_uv_gt, J)
+        T = self.threshold_func(index_uv_gt, J)
+        y_t = F.one_hot(index_uv_gt, index_uv_est.shape[1])
+        prob = torch.softmax(index_uv_est, axis=1).detach()
+        top_values, top_index = prob.topk(18, dim=1, largest=False, sorted=True)
+        mi = index_uv_est.gather(1, top_index[torch.arange(J),-1].unsqueeze(-1))
+        correlation = torch.exp(-(index_uv_est-mi)/(M-mi)).detach()
+        correlation = correlation.scatter(1, top_index, 1.)
+        eql_w = 1. - E * T * (1. - y_t)*correlation
+        x = (index_uv_est-M) - torch.log(torch.sum(eql_w*torch.exp(index_uv_est-M), dim=1)).unsqueeze(1).repeat(1, index_uv_est.shape[1])
+        smooth_loss = -x.mean(dim=-1)
+        index_uv_loss = torch.sum(F.nll_loss(x, index_uv_gt.long())*0.9 + smooth_loss*0.1) * self.w_part
+        
+        # index_uv_loss = F.cross_entropy(index_uv_est, index_uv_gt.long()) * self.w_part
         losses["loss_densepose_I"] = index_uv_loss
 
         if not self.segm_trained_by_masks:
@@ -2130,9 +2350,343 @@ class DensePoseLosses(object):
             s_loss = F.cross_entropy(s_est, s_gt.long()) * self.w_segm
             losses["loss_densepose_S"] = s_loss
         return losses
+    def exclude_func(self, gt_classes, J):
+        weight = torch.zeros((J), dtype=torch.float).cuda()
+        beta = torch.Tensor(weight.shape).cuda().uniform_(0,1)
+        weight[beta < 0.99] = 1.
+        weight = weight.view(J, 1).expand(J, 25)
+        return weight
+
+    def threshold_func(self, gt_classes, J): 
+        weight = torch.zeros(25).cuda()
+        freq = [7,8,11,12]
+        for f in freq:
+            weight[f] = 1
+        weight = weight.unsqueeze(0)
+        weight = weight.repeat(J, 1)
+        return weight
+
+class SABLLosses(object):
+    def __init__(self, cfg):
+        # fmt: off
+        self.heatmap_size = cfg.MODEL.ROI_DENSEPOSE_HEAD.HEATMAP_SIZE
+        self.w_points     = cfg.MODEL.ROI_DENSEPOSE_HEAD.POINT_REGRESSION_WEIGHTS
+        self.w_part       = cfg.MODEL.ROI_DENSEPOSE_HEAD.PART_WEIGHTS
+        self.w_segm       = cfg.MODEL.ROI_DENSEPOSE_HEAD.INDEX_WEIGHTS
+        self.n_segm_chan  = cfg.MODEL.ROI_DENSEPOSE_HEAD.NUM_COARSE_SEGM_CHANNELS
+        # fmt: on
+        self.segm_trained_by_masks = cfg.MODEL.ROI_DENSEPOSE_HEAD.COARSE_SEGM_TRAINED_BY_MASKS
+        self.confidence_model_cfg = DensePoseConfidenceModelConfig.from_cfg(cfg)
+        if self.confidence_model_cfg.uv_confidence.type == DensePoseUVConfidenceType.IID_ISO:
+            self.uv_loss_with_confidences = IIDIsotropicGaussianUVLoss(
+                self.confidence_model_cfg.uv_confidence.epsilon
+            )
+        elif self.confidence_model_cfg.uv_confidence.type == DensePoseUVConfidenceType.INDEP_ANISO:
+            self.uv_loss_with_confidences = IndepAnisotropicGaussianUVLoss(
+                self.confidence_model_cfg.uv_confidence.epsilon
+            )
+        
+        block_fpath = cfg.MODEL.ROI_DENSEPOSE_HEAD.BLOCK_FPATH
+        with open(block_fpath, "rb") as bFile:
+            self.block_file = json.loads(json.load(bFile))
+        self.w_poise_cls     = cfg.MODEL.ROI_DENSEPOSE_HEAD.POISE_CLS_WEIGHTS
+        self.w_poise_reg     = cfg.MODEL.ROI_DENSEPOSE_HEAD.POISE_REGRESSION_WEIGHTS
+
+    def __call__(self, proposals_with_gt, densepose_outputs, densepose_confidences):
+        if not self.segm_trained_by_masks:
+            losses = {}
+            densepose_losses = self.produce_densepose_losses(
+                proposals_with_gt, densepose_outputs[:6], densepose_confidences
+            )
+            losses.update(densepose_losses)
+            return losses
+        else:
+            losses = {}
+            losses_densepose = self.produce_densepose_losses(
+                proposals_with_gt, densepose_outputs, densepose_confidences
+            )
+            losses.update(losses_densepose)
+            losses_mask = self.produce_mask_losses(
+                proposals_with_gt, densepose_outputs, densepose_confidences
+            )
+            losses.update(losses_mask)
+            return losses
+
+    def produce_fake_mask_losses(self, densepose_outputs):
+        losses = {}
+        segm_scores, _, _, _ = densepose_outputs
+        losses["loss_densepose_S"] = segm_scores.sum() * 0
+        return losses
+
+    def produce_mask_losses(self, proposals_with_gt, densepose_outputs, densepose_confidences):
+        if not len(proposals_with_gt):
+            return self.produce_fake_mask_losses(densepose_outputs)
+        losses = {}
+        # densepose outputs are computed for all images and all bounding boxes;
+        # i.e. if a batch has 4 images with (3, 1, 2, 1) proposals respectively,
+        # the outputs will have size(0) == 3+1+2+1 == 7
+        segm_scores, _, _, _ = densepose_outputs
+        with torch.no_grad():
+            mask_loss_data = _extract_data_for_mask_loss_from_matches(
+                proposals_with_gt, segm_scores
+            )
+        if (mask_loss_data.masks_gt is None) or (mask_loss_data.masks_est is None):
+            return self.produce_fake_mask_losses(densepose_outputs)
+        losses["loss_densepose_S"] = (
+            F.cross_entropy(mask_loss_data.masks_est, mask_loss_data.masks_gt.long()) * self.w_segm
+        )
+        return losses
+
+    def produce_fake_densepose_losses(self, densepose_outputs, densepose_confidences):
+        # we need to keep the same computation graph on all the GPUs to
+        # perform reduction properly. Hence even if we have no data on one
+        # of the GPUs, we still need to generate the computation graph.
+        # Add fake (zero) losses in the form Tensor.sum() * 0
+        s, index_uv, u_cls, u_offset, v_cls, v_offset = densepose_outputs
+        losses = {}
+        losses["loss_densepose_I"] = index_uv.sum() * 0
+        if not self.segm_trained_by_masks:
+            losses["loss_densepose_S"] = s.sum() * 0
+        losses["loss_densepose_U_cls"] = u_cls.sum() * 0
+        losses["loss_densepose_U_offset"] = u_cls.sum() * 0
+        losses["loss_densepose_V_cls"] = v_cls.sum() * 0
+        losses["loss_densepose_V_offset"] = v_cls.sum() * 0
+        return losses
+
+    def produce_densepose_losses(self, proposals_with_gt, densepose_outputs, densepose_confidences):
+        losses = {}
+        # densepose outputs are computed for all images and all bounding boxes;
+        # i.e. if a batch has 4 images with (3, 1, 2, 1) proposals respectively,
+        # the outputs will have size(0) == 3+1+2+1 == 7
+        s, index_uv, u_cls, u_offset, v_cls, v_offset = densepose_outputs
+        if not len(proposals_with_gt):
+            return self.produce_fake_densepose_losses(densepose_outputs, densepose_confidences)
+
+        assert u_cls.size(2) == v_cls.size(2)
+        assert u_cls.size(3) == v_cls.size(3)
+        assert u_cls.size(2) == index_uv.size(2)
+        assert u_cls.size(3) == index_uv.size(3)
+
+        with torch.no_grad():
+            (
+                index_uv_img,
+                i_with_dp,
+                bbox_xywh_est,
+                bbox_xywh_gt,
+                index_gt_all,
+                x_norm,
+                y_norm,
+                u_gt_all,
+                v_gt_all,
+                s_gt,
+                index_bbox,
+            ) = _extract_single_tensors_from_matches(  # noqa
+                proposals_with_gt
+            )
+        n_batch = len(i_with_dp)
+        if not n_batch:
+            return self.produce_fake_densepose_losses(densepose_outputs, densepose_confidences)
+
+        est_shape = u_cls.shape
+        u_cls = u_cls.reshape(-1, 24, BLOBK_NUM, est_shape[2], est_shape[3])
+        u_offset = u_offset.reshape(-1, 24, BLOBK_NUM, est_shape[2], est_shape[3])
+        v_cls = v_cls.reshape(-1, 24, BLOBK_NUM, est_shape[2], est_shape[3])
+        v_offset = v_offset.reshape(-1, 24, BLOBK_NUM, est_shape[2], est_shape[3])
+
+        block_u_width = torch.tensor(np.array(self.block_file["bucket_u_width"]), dtype=torch.float32, device=u_gt_all.device)
+        block_v_width = torch.tensor(np.array(self.block_file["bucket_v_width"]), dtype=torch.float32, device=v_gt_all.device)
+        block_u_center = torch.tensor(np.array(self.block_file["bucket_u_center"]), dtype=torch.float32, device=u_gt_all.device)
+        block_v_center = torch.tensor(np.array(self.block_file["bucket_v_center"]), dtype=torch.float32, device=v_gt_all.device)
+        u_gt_cls, u_gt_offsets = uvToBlocks(u_gt_all, block_u_width, block_u_center, index_gt_all-1, block_u_width.shape[1])
+        v_gt_cls, v_gt_offsets = uvToBlocks(v_gt_all, block_v_width, block_v_center, index_gt_all-1, block_v_width.shape[1])
+        del block_u_width, block_v_width, block_u_center, block_v_center
+        # NOTE: we need to keep the same computation graph on all the GPUs to
+        # perform reduction properly. Hence even if we have no data on one
+        # of the GPUs, we still need to generate the computation graph.
+        # Add fake (zero) loss in the form Tensor.sum() * 0
+
+        zh = u_cls.size(3)
+        zw = u_cls.size(4)
+
+        (
+            j_valid,
+            y_lo,
+            y_hi,
+            x_lo,
+            x_hi,
+            w_ylo_xlo,
+            w_ylo_xhi,
+            w_yhi_xlo,
+            w_yhi_xhi,
+        ) = _grid_sampling_utilities(  # noqa
+            zh, zw, bbox_xywh_est, bbox_xywh_gt, index_gt_all, x_norm, y_norm, index_bbox
+        )
+
+        j_valid_fg = j_valid * (index_gt_all > 0)
+
+        # print(est_shape)
+        # print(index_bbox.shape)
+        # print(index_gt_all.shape)
+        # print(u_gt_cls.shape)
+        u_est_cls = _extract_at_points_packed(
+            u_cls[i_with_dp],
+            index_bbox,
+            index_gt_all-1,
+            y_lo,
+            y_hi,
+            x_lo,
+            x_hi,
+            w_ylo_xlo[:, None],
+            w_ylo_xhi[:, None],
+            w_yhi_xlo[:, None],
+            w_yhi_xhi[:, None],
+            block = True,
+            block_slice = slice(None),
+        )[j_valid_fg,:]
+        u_est_offsets = _extract_at_points_packed(
+            u_offset[i_with_dp],
+            index_bbox,
+            index_gt_all-1,
+            y_lo,
+            y_hi,
+            x_lo,
+            x_hi,
+            w_ylo_xlo,
+            w_ylo_xhi,
+            w_yhi_xlo,
+            w_yhi_xhi,
+            block = True,
+            block_slice = u_gt_cls,
+        )[j_valid_fg] # J
+        v_est_cls = _extract_at_points_packed(
+            v_cls[i_with_dp],
+            index_bbox,
+            index_gt_all-1,
+            y_lo,
+            y_hi,
+            x_lo,
+            x_hi,
+            w_ylo_xlo[:, None],
+            w_ylo_xhi[:, None],
+            w_yhi_xlo[:, None],
+            w_yhi_xhi[:, None],
+            block = True,
+            block_slice = slice(None),
+        )[j_valid_fg,:]
+        v_est_offsets = _extract_at_points_packed(
+            v_offset[i_with_dp],
+            index_bbox,
+            index_gt_all-1,
+            y_lo,
+            y_hi,
+            x_lo,
+            x_hi,
+            w_ylo_xlo,
+            w_ylo_xhi,
+            w_yhi_xlo,
+            w_yhi_xhi,
+            block = True,
+            block_slice = v_gt_cls,
+        )[j_valid_fg] # J
+        del u_cls, u_offset, v_cls, v_offset
+        
+        u_gt_cls = u_gt_cls[j_valid_fg]
+        v_gt_cls = v_gt_cls[j_valid_fg]
+        u_gt_offsets = u_gt_offsets[j_valid_fg] # J*2
+        v_gt_offsets = v_gt_offsets[j_valid_fg]
+
+        index_uv_gt = index_gt_all[j_valid]
+        # print(index_uv[i_with_dp].shape)
+        # print(index_bbox.shape)
+        index_uv_est_all = _extract_at_points_packed(
+            index_uv[i_with_dp],
+            index_bbox,
+            slice(None),
+            y_lo,
+            y_hi,
+            x_lo,
+            x_hi,
+            w_ylo_xlo[:, None],
+            w_ylo_xhi[:, None],
+            w_yhi_xlo[:, None],
+            w_yhi_xhi[:, None],
+        )
+        index_uv_est = index_uv_est_all[j_valid, :]
+
+        # Resample everything to the estimated data size, no need to resample
+        # S_est then:
+        if not self.segm_trained_by_masks:
+            s_est = s[i_with_dp]
+            with torch.no_grad():
+                s_gt = _resample_data(
+                    s_gt.unsqueeze(1),
+                    bbox_xywh_gt,
+                    bbox_xywh_est,
+                    self.heatmap_size,
+                    self.heatmap_size,
+                    mode="nearest",
+                    padding_mode="zeros",
+                ).squeeze(1)
+
+        # add point-based losses:
+        losses["loss_densepose_U_cls"] = torch.sum(self.labelSmoothing(u_est_cls, u_gt_cls.long()))*self.w_poise_cls
+        losses["loss_densepose_U_offset"] = F.smooth_l1_loss(u_est_offsets, u_gt_offsets, reduction="sum")*self.w_poise_reg
+        losses["loss_densepose_V_cls"] = torch.sum(self.labelSmoothing(v_est_cls, v_gt_cls.long()))*self.w_poise_cls
+        losses["loss_densepose_V_offset"] = F.smooth_l1_loss(v_est_offsets, v_gt_offsets, reduction="sum")*self.w_poise_reg
+        
+        # AEQL
+        J = index_uv_gt.shape[0]
+        M = torch.max(index_uv_est, dim=1, keepdim=True)[0]
+        E = self.exclude_func(index_uv_gt, J)
+        T = self.threshold_func(index_uv_gt, J)
+        y_t = F.one_hot(index_uv_gt, index_uv_est.shape[1])
+        prob = torch.softmax(index_uv_est, axis=1).detach()
+        top_values, top_index = prob.topk(18, dim=1, largest=False, sorted=True)
+        mi = index_uv_est.gather(1, top_index[torch.arange(J),-1].unsqueeze(-1))
+        correlation = torch.exp(-(index_uv_est-mi)/(M-mi)).detach()
+        correlation = correlation.scatter(1, top_index, 1.)
+        eql_w = 1. - E * T * (1. - y_t)*correlation
+        x = (index_uv_est-M) - torch.log(torch.sum(eql_w*torch.exp(index_uv_est-M), dim=1)).unsqueeze(1).repeat(1, index_uv_est.shape[1])
+        smooth_loss = -x.mean(dim=-1)
+        index_uv_loss = torch.sum(F.nll_loss(x, index_uv_gt.long())*0.9 + smooth_loss*0.1) * self.w_part
+        
+        # index_uv_loss = F.cross_entropy(index_uv_est, index_uv_gt.long()) * self.w_part
+        losses["loss_densepose_I"] = index_uv_loss
+
+        if not self.segm_trained_by_masks:
+            if self.n_segm_chan == 2:
+                s_gt = s_gt > 0
+            s_loss = F.cross_entropy(s_est, s_gt.long()) * self.w_segm
+            losses["loss_densepose_S"] = s_loss
+        return losses
+    def labelSmoothing(self, x, target, bce=False):
+        logprobs = F.log_softmax(x, dim=-1)
+        nll_loss = F.nll_loss(logprobs, target)
+        smooth_loss = -logprobs.mean(dim=-1)
+        loss = nll_loss*0.9 + smooth_loss*0.1
+        return loss
+    def exclude_func(self, gt_classes, J):
+        weight = torch.zeros((J), dtype=torch.float).cuda()
+        beta = torch.Tensor(weight.shape).cuda().uniform_(0,1)
+        weight[beta < 0.99] = 1.
+        weight = weight.view(J, 1).expand(J, 25)
+        return weight
+
+    def threshold_func(self, gt_classes, J): 
+        weight = torch.zeros(25).cuda()
+        freq = [7,8,11,12]
+        for f in freq:
+            weight[f] = 1
+        weight = weight.unsqueeze(0)
+        weight = weight.repeat(J, 1)
+        return weight
 
 def build_densepose_losses(cfg):
     losses = DensePoseLosses(cfg)
+    return losses
+
+def build_sabl_losses(cfg):
+    losses = SABLLosses(cfg)
     return losses
 
 def _extract_single_tensors_from_matches_one_image_v2(
@@ -2418,3 +2972,20 @@ class KTNLosses(object):
 def build_ktn_losses(cfg):
     losses = KTNLosses(cfg)
     return losses
+
+def uvToBlocks(u_gt, block_width, block_center, i_est, block_num):
+    J = i_est.shape[0]
+    block_center = block_center.unsqueeze(0).repeat(J,1,1)
+    block_center = block_center[torch.arange(J), i_est, :].squeeze(1)
+
+    block_width = block_width.unsqueeze(0).repeat(J,1,1)
+    block_width = block_width[torch.arange(J), i_est, :].squeeze(1) # J*10
+
+    u_gt = u_gt.unsqueeze(1).repeat(1,block_num) # J*10
+
+    offsets = (u_gt - block_center)/block_width # J*10
+    offsets_val, offsets_indices = torch.topk(torch.abs(offsets), 1, dim=1, largest=False, sorted=True) #J*2
+    gt_cls = offsets_indices[torch.arange(J),0].squeeze() # J
+    gt_offsets = offsets[torch.arange(J), gt_cls]
+    
+    return gt_cls,gt_offsets

@@ -177,6 +177,10 @@ def add_densepose_config(cfg: CN):
 
     _C.MODEL.ROI_DENSEPOSE_HEAD.BODY_MASK_WEIGHTS = 5.0
 
+    _C.MODEL.ROI_DENSEPOSE_HEAD.BLOCK_FPATH = ""
+    _C.MODEL.ROI_DENSEPOSE_HEAD.POISE_CLS_WEIGHTS = 0.01
+    _C.MODEL.ROI_DENSEPOSE_HEAD.POISE_REGRESSION_WEIGHTS = 0.01
+
 def add_hrnet_config(cfg: CN):
     """
     Add config for HRNet backbone.
